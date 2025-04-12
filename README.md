@@ -1,4 +1,4 @@
-# ratelimit
+# RateLimit
 
 [![golang](https://img.shields.io/badge/Language-Go-green.svg)](https://golang.org/)
 [![GoDoc](https://godoc.org/github.com/mwat56/ratelimit?status.svg)](https://godoc.org/github.com/mwat56/ratelimit)
@@ -9,8 +9,13 @@
 [![View examples](https://img.shields.io/badge/learn%20by-examples-0077b3.svg)](https://github.com/mwat56/ratelimit/blob/main/_demo/demo.go)
 [![License](https://img.shields.io/github/mwat56/ratelimit.svg)](https://github.com/mwat56/ratelimit/blob/main/LICENSE)
 
-- [ratelimit](#xxx)
+- [RateLimit](#ratelimit)
 	- [Purpose](#purpose)
+		- [Key Features](#key-features)
+		- [Basic Concept](#basic-concept)
+		- [Implementation in this package](#implementation-in-this-package)
+		- [How it Works](#how-it-works)
+		- [Advantages](#advantages)
 	- [Installation](#installation)
 	- [Usage](#usage)
 	- [Libraries](#libraries)
@@ -20,7 +25,78 @@
 
 ## Purpose
 
-    //TODO
+This package implements _rate limiting middleware_ for HTTP servers. It provides functionality to control the number of requests from individual IP addresses within a specified time window.
+
+A _sliding window rate limiter_ is a rate limiting algorithm that provides a smoother, more accurate way to control request rates compared to fixed window approaches. Let me explain the concept and implementation.
+
+### Key Features
+
+- Uses a sliding window algorithm for rate limiting.
+- Handles both IPv4 and IPv6 addresses.
+- Properly processes X-Forwarded-For headers for proxy chains.
+- Thread-safe implementation using mutexes.
+
+### Basic Concept
+
+- Instead of using fixed time windows (e.g., exactly from 2:00 to 3:00), the window "slides" with time.
+- Each request is evaluated against a window that ends at the current time and starts at (current time - window duration).
+- Provides more accurate rate limiting by avoiding edge cases at window boundaries.
+
+### Implementation in this package
+
+	type (
+		tSlidingWindowCounter struct {
+			mtx          sync.Mutex
+			prevCount    int           // requests in previous window
+			currentCount int           // requests in current window
+			windowStart  time.Time     // start time of current window
+		}
+
+		tClientList map[string]*tSlidingWindowCounter
+	)
+
+### How it Works
+
+Let's say we have a 60-second window limit of 100 requests. Here's how the calculation works:
+
+	Window Duration: 60 seconds
+	Current Time: 2:00:45
+	Window Start: 2:00:00
+	Previous Window Count: 80
+	Current Window Count: 30
+	Elapsed Time: 45 seconds
+	Remaining Time: 15 seconds
+
+	Weight calculation:
+	- Remaining = 15 seconds = 25% of window
+	- Previous window weight = 0.25 (25%)
+	- Weighted count = (80 * 0.25) + 30 = 50
+
+**Visual representation:**
+
+	Previous Window     Current Window
+	[    80 reqs    ][    30 reqs    ]
+	|               |                |
+	1:59:00        2:00:00         2:00:45
+					|----- 45s -----|
+					|---- 15s ---|
+					(remaining time)
+
+### Advantages
+
+- Smoother rate limiting without sharp cutoffs.
+- More accurate request counting.
+- Prevents request spikes at window boundaries.
+- Better handles continuous traffic patterns.
+
+The sliding window approach provides a more sophisticated rate limiting solution than other methods that
+
+- prevents traffic spikes at window boundaries,
+- provides more accurate rate limiting,
+- better handles real-world traffic patterns,
+- maintains a smoother request distribution over time.
+
+This makes it particularly suitable for APIs and web services where consistent request handling is important.
 
 ## Installation
 
@@ -30,17 +106,41 @@ You can use `Go` to install this package for you:
 
 ## Usage
 
-    //TODO
+To include the rate limiting provided by this package you just call the `Wrap()` function as shown here:
+
+	import "github.com/mwat56/ratelimit"
+	// ...
+
+	func main() {
+		// ...
+		// system setup etc.
+
+		maxRequests := 1000 // max requests per minute
+		windowDuration := time.Minute // window duration
+		// these values should probably come from some
+		// configuration file or commandline option.
+
+		pageHandler := http.NewServeMux() // or your own page handling provider
+		pageHandler.HandleFunc("/", myHandler) // dito
+
+		server := http.Server{
+			Addr:    "127.0.0.1:8080",
+			Handler: ratelimit.Wrap(pageHandler, maxRequests,windowDuration),
+			//       ^^^^^^^^^^^^^^^
+		}
+
+		if err := server.ListenAndServe(); nil != err {
+			log.Fatalf("%s: %v", os.Args[0], err)
+		}
+	} // main()
 
 ## Libraries
 
-The following external libraries were used building `ratelimit`:
-
-* [ApacheLogger](https://github.com/mwat56/apachelogger)
+No external libraries were used building `ratelimit`.
 
 ## Licence
 
-        Copyright © 2024 M.Watermann, 10247 Berlin, Germany
+        Copyright © 2025 M.Watermann, 10247 Berlin, Germany
                         All rights reserved
                     EMail : <support@mwat.de>
 
