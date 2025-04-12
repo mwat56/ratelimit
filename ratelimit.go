@@ -1,205 +1,179 @@
 /*
-   Copyright © 2024  M.Watermann, 10247 Berlin, Germany
-               All rights reserved
-           EMail : <support@mwat.de>
+Copyright © 2025  M.Watermann, 10247 Berlin, Germany
+
+	    All rights reserved
+	EMail : <support@mwat.de>
 */
-package main
+package ratelimit
 
 //lint:file-ignore ST1017 - I prefer Yoda conditions
 
 import (
-	"context"
-	"crypto/tls"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
-	"net/url"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"runtime"
-	"syscall"
+	"strings"
+	"sync"
 	"time"
-
-	"github.com/NYTimes/gziphandler"
-	"github.com/mwat56/apachelogger"
-	"github.com/mwat56/errorhandler"
-	"github.com/mwat56/ratelimit"
 )
 
-// `exit()` Log `aMessage` and terminate the program.
-func exit(aMessage string) {
-	apachelogger.Err("APPNAME/main", aMessage)
-	runtime.Gosched() // let the logger write
-	log.Fatalln(aMessage)
-} // exit()
+type (
+	tSlidingWindowCounter struct {
+		mtx          sync.Mutex
+		prevCount    int
+		currentCount int
+		windowStart  time.Time
+	}
 
-// `redirHTTP()` Send HTTP clients to HTTPS server.
+	tClientList map[string]*tSlidingWindowCounter
+
+	tSlidingWindowLimiter struct {
+		sync.Mutex
+		clients        tClientList
+		maxRequests    int
+		windowDuration time.Duration
+	}
+)
+
+// `cleanIP()` validates and formats an IP address string.
 //
-// see: https://gist.github.com/d-schmidt/587ceec34ce1334a5e60
-func redirHTTP(aWriter http.ResponseWriter, aRequest *http.Request) {
-	// Copy the original URL and replace the scheme:
-	targetURL := url.URL{
-		Scheme:     `https`,
-		Opaque:     aRequest.URL.Opaque,
-		User:       aRequest.URL.User,
-		Host:       aRequest.URL.Host,
-		Path:       aRequest.URL.Path,
-		RawPath:    aRequest.URL.RawPath,
-		ForceQuery: aRequest.URL.ForceQuery,
-		RawQuery:   aRequest.URL.RawQuery,
-		Fragment:   aRequest.URL.Fragment,
+// The function handles both IPv4 and IPv6 addresses, ensuring they are
+// in a consistent format.
+//
+// Parameters:
+//   - `aIP`: The IP address to clean and validate
+//
+// Returns:
+//   - `string`: A cleaned and validated IP address, or empty string if invalid
+func cleanIP(aIP string) string {
+	// Remove any brackets from IPv6 addresses
+	aIP = strings.Trim(aIP, "[]")
+
+	// Parse IP address
+	netIP := net.ParseIP(aIP)
+	if nil == netIP {
+		return ""
 	}
-	target := targetURL.String()
 
-	apachelogger.Err(`APPNAME/main`, `redirecting to: `+target)
-	http.Redirect(aWriter, aRequest, target, http.StatusTemporaryRedirect)
-} // redirHTTP()
-)
+	// Convert to consistent format
+	if ipv4 := netIP.To4(); ipv4 != nil {
+		return ipv4.String()
+	}
 
-// `setupSignals()` configures the capture of the interrupts `SIGINT`
-// `and `SIGTERM` to terminate the program gracefully.
-func setupSignals(aServer *http.Server) {
-	// handle `CTRL-C` and `kill(15)`.
-	c := make(chan os.Signal, 2)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	return netIP.String()
+} // cleanIP()
 
-	go func() {
-		for signal := range c {
-			msg := fmt.Sprintf("%s captured '%v', stopping program and exiting ...", filepath.Base(os.Args[0]), signal)
-			apachelogger.Err(`Nele/catchSignals`, msg)
-			log.Println(msg)
-			break
-		} // for
-
-		ctx, cancel := context.WithCancel(context.Background())
-		aServer.BaseContext = func(net.Listener) context.Context {
-			return ctx
+// `getClientIP()` extracts and validates the client's IP address from
+// an HTTP request.
+//
+// The function handles both IPv4 and IPv6 addresses and properly processes
+// `X-Forwarded-For` headers in proxy chains. It follows these steps to
+// determine the client IP:
+// 1. Check `X-Forwarded-For` header
+// 2. Extract the leftmost valid IP (original client)
+// 3. Fall back to `RemoteAddr` if no valid IP is found
+// 4. Clean and validate the IP address
+//
+// Parameters:
+//   - `aRequest`: The incoming HTTP request containing client information.
+//
+// Returns:
+//   - `string`: A validated client IP address
+//   - `error`: Error if no valid IP address could be determined
+func getClientIP(aRequest *http.Request) (string, error) {
+	// First try X-Forwarded-For header
+	if xff := aRequest.Header.Get("X-Forwarded-For"); "" != xff {
+		// Split IPs and get the original client IP (leftmost)
+		ips := strings.Split(xff, ",")
+		for _, ip := range ips {
+			// Clean the IP string
+			ip = strings.TrimSpace(ip)
+			if validIP := cleanIP(ip); "" != validIP {
+				return validIP, nil
+			}
 		}
-		aServer.RegisterOnShutdown(cancel)
+	}
 
-		ctxTimeout, cancelTimeout := context.WithTimeout(
-			context.Background(), time.Second*10)
-		defer cancelTimeout()
-		if err := aServer.Shutdown(ctxTimeout); nil != err {
-			exit(fmt.Sprintf("%s: %v", filepath.Base(os.Args[0]), err))
+	// Fall back to RemoteAddr
+	host, _, err := net.SplitHostPort(aRequest.RemoteAddr)
+	if err != nil {
+		// Try RemoteAddr directly in case it's just an IP
+		if validIP := cleanIP(aRequest.RemoteAddr); "" != validIP {
+			return validIP, nil
 		}
-	}()
-} // setupSignals()
-
-
-// Actually run the program …
-func main() {
-	var (
-		err     error
-		handler http.Handler
-		ph      *nele.TPageHandler
-	)
-	Me, _ := filepath.Abs(os.Args[0])
-
-	// Read INI files and commandline options
-	APPNAME.InitConfig()
-
-	if ph, err = nele.NewPageHandler(); nil != err {
-		nele.ShowHelp()
-		exit(fmt.Sprintf("%s: %v", Me, err))
+		return "", fmt.Errorf("invalid RemoteAddr: %v", err)
 	}
 
-	// Setup the errorpage handler:
-	handler = errorhandler.Wrap(ph, ph)
-
-	// Inspect `gzip` commandline argument and setup the Gzip handler:
-	if APPNAME.AppArgs.GZip {
-		handler = gziphandler.GzipHandler(handler)
+	if validIP := cleanIP(host); "" != validIP {
+		return validIP, nil
 	}
 
-	// Inspect logging commandline arguments and setup the `ApacheLogger`:
-	handler = apachelogger.Wrap(handler, nele.AppArgs.AccessLog, nele.AppArgs.ErrorLog)
+	return "", fmt.Errorf("no valid IP address found")
+} // getClientIP()
 
-	ctxTimeout, cancelTimeout := context.WithTimeout(
-		context.Background(), time.Second*10)
-	defer cancelTimeout()
-
-	// We need a `server` reference to use it in `setupSignals()`
-	// and to set some reasonable timeouts:
-	server := &http.Server{
-		// The TCP address for the server to listen on:
-		Addr: APPNAME.AppArgs.Addr,
-		// Return the base context for incoming requests on this server:
-		BaseContext: func(net.Listener) context.Context {
-			return ctxTimeout
-		},
-		// Request handler to invoke:
-		Handler: handler,
-		// Set timeouts so that a slow or malicious client
-		// doesn't hold resources forever
-		//
-		// The maximum amount of time to wait for the next request;
-		// if IdleTimeout is zero, the value of ReadTimeout is used:
-		IdleTimeout: 0,
-		// The amount of time allowed to read request headers:
-		ReadHeaderTimeout: 10 * time.Second,
-		// The maximum duration for reading the entire request,
-		// including the body:
-		ReadTimeout: 10 * time.Second,
-		// The maximum duration before timing out writes of the response:
-		// WriteTimeout: 10 * time.Second,
-		WriteTimeout: -1, // see whether this eliminates "i/o timeout HTTP/1.0"
-	}
-	if 0 < len(APPMAME.AppArgs.ErrorLog) {
-		apachelogger.SetErrLog(server)
-	}
-	setupSignals(server)
-
-	if 0 < len(APPNAME.AppArgs.CertKey) && (0 < len(APPNAME.AppArgs.CertPem)) {
-		// start the HTTP to HTTPS redirector:
-		go http.ListenAndServe(APPNAME.AppArgs.Addr, http.HandlerFunc(redirHTTP))
-
-		// see:
-		// https://ssl-config.mozilla.org/#server=golang&version=1.14.1&config=old&guideline=5.4
-		server.TLSConfig = &tls.Config{
-			MinVersion:               tls.VersionTLS10,
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-				tls.TLS_RSA_WITH_RC4_128_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, // #nosec G402
-			},
-		} // #nosec G402
-		// server.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
-
-		s := fmt.Sprintf("%s listening HTTPS at: %s", Me, APPNAME.AppArgs.Addr)
-		log.Println(s)
-		apachelogger.Log("APPNAME/main", s)
-		exit(fmt.Sprintf("%s: %v", Me,
-			server.ListenAndServeTLS(APPNAME.AppArgs.CertPem, APPNAME.AppArgs.CertKey)))
-		return
+// `Wrap()` creates a new rate limiting middleware handler.
+// It uses a sliding window algorithm to limit requests per client IP.
+//
+// Parameters:
+//   - `aNext`: The next handler in the middleware chain.
+//   - `aMaxReq`: Maximum number of requests allowed per window.
+//   - `aDuration`: The time window duration.
+//
+// Returns:
+//   - `http.Handler`: A new handler that implements rate limiting
+func Wrap(aNext http.Handler, aMaxReq int, aDuration time.Duration) http.Handler {
+	limiter := &tSlidingWindowLimiter{
+		clients:        make(tClientList),
+		maxRequests:    aMaxReq,
+		windowDuration: aDuration,
 	}
 
-	s := fmt.Sprintf("%s listening HTTP at: %s", Me, APPNAME.AppArgs.Addr)
-	log.Println(s)
-	apachelogger.Log("APPNAME/main", s)
-	exit(fmt.Sprintf("%s: %v", Me, server.ListenAndServe()))
-} // main()
+	return http.HandlerFunc(func(aWriter http.ResponseWriter, aRequest *http.Request) {
+		// Get and validate client IP
+		clientIP, err := getClientIP(aRequest)
+		if err != nil {
+			http.Error(aWriter, "Forbidden - Invalid IP", http.StatusForbidden)
+			return
+		}
+
+		limiter.Lock()
+		defer limiter.Unlock()
+
+		now := time.Now().UTC() // Use UTC to avoid DST issues
+		counter, exists := limiter.clients[clientIP]
+		if !exists {
+			counter = &tSlidingWindowCounter{
+				windowStart: now,
+			}
+			limiter.clients[clientIP] = counter
+		}
+
+		counter.mtx.Lock()
+		defer counter.mtx.Unlock()
+
+		elapsed := now.Sub(counter.windowStart)
+		if elapsed > limiter.windowDuration {
+			// Window has expired, reset counts
+			counter.prevCount = counter.currentCount
+			counter.currentCount = 0
+			counter.windowStart = now
+			elapsed = 0
+		}
+
+		// Calculate the weighted request count
+		remainingWindow := limiter.windowDuration - elapsed
+		prevWeight := float64(remainingWindow) / float64(limiter.windowDuration)
+		weightedCount := int(float64(counter.prevCount)*prevWeight) + counter.currentCount + 1
+
+		// Check if the request would exceed the rate limit
+		if weightedCount > limiter.maxRequests {
+			http.Error(aWriter, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		counter.currentCount++
+		aNext.ServeHTTP(aWriter, aRequest)
+	})
+} // Wrap()
 
 /* _EoF_ */
