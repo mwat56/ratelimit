@@ -1,0 +1,8 @@
+*~
+*.bak
+bin/
+.git/
+.github/
+TODO*
+.vscode/
+XXX*
