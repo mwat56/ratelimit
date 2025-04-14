@@ -10,13 +10,12 @@ package ratelimit
 
 import (
 	"fmt"
-	"hash/crc32"
-	"hash/fnv"
 	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,6 +40,14 @@ type (
 		clients    tClientList // IP-to-counter map  for this shard
 	}
 
+	// `TMetrics` holds rate limiting metrics
+	TMetrics struct {
+		TotalRequests   uint64        // Total number of requests processed
+		BlockedRequests uint64        // Number of requests that exceeded rate limits
+		ActiveClients   uint64        // Current number of tracked client IPs
+		CleanupDuration time.Duration // Interval between cleanup runs
+	}
+
 	// `tShardedLimiter` implements a sharded rate limiter that distributes
 	// client IPs across multiple shards to reduce lock contention.
 	tShardedLimiter struct {
@@ -48,6 +55,7 @@ type (
 		maxRequests     int                       // maximum requests per window
 		windowDuration  time.Duration             // duration of the sliding window
 		cleanupInterval time.Duration             // interval between cleanup runs
+		metrics         TMetrics                  // metrics for rate limiting
 	}
 )
 
@@ -128,6 +136,22 @@ func (sl *tShardedLimiter) getShard(aIP string) *tSlidingWindowShard {
 	return sl.shards[sum%256]
 } // getShard()
 
+func (sl *tShardedLimiter) GetMetrics() TMetrics {
+	var total uint64
+	for _, shard := range sl.shards {
+		shard.Lock()
+		total += uint64(len(shard.clients))
+		shard.Unlock()
+	}
+
+	return TMetrics{
+		TotalRequests:   atomic.LoadUint64(&sl.metrics.TotalRequests),
+		BlockedRequests: atomic.LoadUint64(&sl.metrics.BlockedRequests),
+		ActiveClients:   total,
+		CleanupDuration: sl.cleanupInterval,
+	}
+} // GetMetrics()
+
 // `isAllowed()` checks if a request from the given IP address is
 // allowed based on the rate limiting rules.
 //
@@ -137,6 +161,8 @@ func (sl *tShardedLimiter) getShard(aIP string) *tSlidingWindowShard {
 // Returns:
 //   - `bool`: Whether the request is within the rate limits.
 func (sl *tShardedLimiter) isAllowed(aIP string) bool {
+	atomic.AddUint64(&sl.metrics.TotalRequests, 1)
+
 	shard := sl.getShard(aIP)
 	shard.Lock()
 	defer shard.Unlock()
@@ -156,19 +182,29 @@ func (sl *tShardedLimiter) isAllowed(aIP string) bool {
 	counter.Lock()
 	defer counter.Unlock()
 
-	if sl.windowDuration < time.Since(counter.windowStart) {
-		// Window has expired, reset counts
-		counter.prevCount = 0
+	elapsed := time.Since(counter.windowStart)
+	if sl.windowDuration < elapsed {
+		// Window has expired, shift window
+		counter.prevCount = counter.currentCount
 		counter.currentCount = 1
 		counter.windowStart = now
-
 		return true
 	}
-	counter.prevCount = counter.currentCount
-	counter.currentCount++
 
-	// Return whether the request would exceed the rate limit
-	return counter.currentCount <= sl.maxRequests
+	// Calculate the weight of the previous window
+	weightPrev := 1.0 - (elapsed.Seconds() / sl.windowDuration.Seconds())
+
+	// Calculate total requests using weighted sliding window
+	weightedCount := int(float64(counter.prevCount)*weightPrev) + counter.currentCount
+
+	allowed := weightedCount <= sl.maxRequests
+	if allowed {
+		counter.currentCount++
+	} else {
+		atomic.AddUint64(&sl.metrics.BlockedRequests, 1)
+	}
+
+	return allowed
 } // isAllowed()
 
 // ---------------------------------------------------------------------------
@@ -220,7 +256,7 @@ func cleanIP(aIP string) string {
 //   - `string`: A validated client IP address
 //   - `error`: Error if no valid IP address could be determined
 func getClientIP(aRequest *http.Request) (string, error) {
-	// First try X-Forwarded-For header
+	// First try `X-Forwarded-For` header
 	if xff := aRequest.Header.Get("X-Forwarded-For"); "" != xff {
 		// Split IPs and get the original client IP (leftmost)
 		ips := strings.Split(xff, ",")
@@ -233,10 +269,10 @@ func getClientIP(aRequest *http.Request) (string, error) {
 		}
 	}
 
-	// Fall back to RemoteAddr
+	// Fall back to `RemoteAddr`
 	host, _, err := net.SplitHostPort(aRequest.RemoteAddr)
 	if err != nil {
-		// Try RemoteAddr directly in case it's just an IP
+		// Try `RemoteAddr` directly in case it's just an IP
 		if validIP := cleanIP(aRequest.RemoteAddr); "" != validIP {
 			return validIP, nil
 		}
@@ -249,34 +285,6 @@ func getClientIP(aRequest *http.Request) (string, error) {
 
 	return "", fmt.Errorf("no valid IP address found")
 } // getClientIP()
-
-func fastIPHash(aIP string) uint {
-	ip := net.ParseIP(aIP)
-	if nil == ip {
-		return 0
-	}
-
-	// Fastest non-cryptographic hash (CRC-32)
-	return uint(crc32.ChecksumIEEE(ip) % 256)
-} // fastIPHash()
-
-func getHashFnv(aIP string) uint {
-	h := fnv.New64a()
-	// Safe for digits/dots (no allocations beyond byte conversion):
-	h.Write([]byte(aIP))
-
-	return uint(h.Sum64() % 256)
-} // getHashFnv()
-
-func getHashSum(aIP string) uint {
-	// Simple hash function for IP-based sharding
-	sum := 0
-	for i := 0; i < len(aIP); i++ {
-		sum += int(aIP[i])
-	}
-
-	return uint(sum % 256)
-} // getHashSum()
 
 // ---------------------------------------------------------------------------
 // constructor methods:
@@ -294,6 +302,7 @@ func newShardedLimiter(aMaxReq int, aDuration time.Duration) *tShardedLimiter {
 		maxRequests:     aMaxReq,
 		windowDuration:  aDuration,
 		cleanupInterval: aDuration * 2,
+		metrics:         TMetrics{},
 	}
 
 	for i := range result.shards {
@@ -319,24 +328,29 @@ func newShardedLimiter(aMaxReq int, aDuration time.Duration) *tShardedLimiter {
 //
 // Returns:
 //   - `http.Handler`: A new handler that implements rate limiting
-func Wrap(aNext http.Handler, aMaxReq int, aDuration time.Duration) http.Handler {
+//   - `func() TMetrics`: A function that returns usage metrics.
+func Wrap(aNext http.Handler, aMaxReq int, aDuration time.Duration) (http.Handler, func() TMetrics) {
 	limiter := newShardedLimiter(aMaxReq, aDuration)
 
+	// Return both the handler and a function that returns metrics
 	return http.HandlerFunc(func(aWriter http.ResponseWriter, aRequest *http.Request) {
-		// Get and validate client IP
-		clientIP, err := getClientIP(aRequest)
-		if nil != err {
-			http.Error(aWriter, "Forbidden - Invalid IP", http.StatusForbidden)
-			return
-		}
+			// Get and validate client IP
+			clientIP, err := getClientIP(aRequest)
+			if nil != err {
+				http.Error(aWriter, "Forbidden - Invalid IP", http.StatusForbidden)
+				return
+			}
 
-		if !limiter.isAllowed(clientIP) {
-			http.Error(aWriter, "Rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
+			if !limiter.isAllowed(clientIP) {
+				http.Error(aWriter, "Rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
 
-		aNext.ServeHTTP(aWriter, aRequest)
-	})
+			aNext.ServeHTTP(aWriter, aRequest)
+		}),
+		func() TMetrics {
+			return limiter.GetMetrics()
+		}
 } // Wrap()
 
 /* _EoF_ */
