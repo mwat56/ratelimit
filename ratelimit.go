@@ -29,11 +29,38 @@ type (
 
 	tSlidingWindowLimiter struct {
 		sync.Mutex
-		clients        tClientList
-		maxRequests    int
-		windowDuration time.Duration
+		clients         tClientList
+		maxRequests     int
+		windowDuration  time.Duration
+		cleanupInterval time.Duration
 	}
 )
+
+func (l *tSlidingWindowLimiter) cleanup() {
+	l.Lock()
+	defer l.Unlock()
+
+	threshold := time.Now().UTC().Add(-l.windowDuration * 2)
+	for ip, counter := range l.clients {
+		func() {
+			counter.mtx.Lock()
+			defer counter.mtx.Unlock()
+
+			// Remove clients that haven't made any requests
+			// in the last two windows:
+			if counter.windowStart.Before(threshold) && counter.currentCount == 0 {
+				delete(l.clients, ip)
+			}
+		}()
+	}
+} // cleanup()
+
+func (l *tSlidingWindowLimiter) startCleanup() {
+	ticker := time.NewTicker(l.cleanupInterval)
+	for range ticker.C {
+		l.cleanup()
+	}
+} // startCleanup()
 
 // `cleanIP()` validates and formats an IP address string.
 //
@@ -111,6 +138,22 @@ func getClientIP(aRequest *http.Request) (string, error) {
 	return "", fmt.Errorf("no valid IP address found")
 } // getClientIP()
 
+// newLimiter creates a new rate limiter with automatic cleanup
+func newLimiter(aMaxReq int, aDuration time.Duration) *tSlidingWindowLimiter {
+	limiter := &tSlidingWindowLimiter{
+		clients:         make(tClientList),
+		maxRequests:     aMaxReq,
+		windowDuration:  aDuration,
+		cleanupInterval: aDuration * 2,
+	}
+
+	go limiter.startCleanup()
+
+	return limiter
+} // newLimiter()
+
+// ---------------------------------------------------------------------------
+
 // `Wrap()` creates a new rate limiting middleware handler.
 // It uses a sliding window algorithm to limit requests per client IP.
 //
@@ -122,11 +165,7 @@ func getClientIP(aRequest *http.Request) (string, error) {
 // Returns:
 //   - `http.Handler`: A new handler that implements rate limiting
 func Wrap(aNext http.Handler, aMaxReq int, aDuration time.Duration) http.Handler {
-	limiter := &tSlidingWindowLimiter{
-		clients:        make(tClientList),
-		maxRequests:    aMaxReq,
-		windowDuration: aDuration,
-	}
+	limiter := newLimiter(aMaxReq, aDuration)
 
 	return http.HandlerFunc(func(aWriter http.ResponseWriter, aRequest *http.Request) {
 		// Get and validate client IP
