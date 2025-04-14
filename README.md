@@ -14,6 +14,9 @@
 		- [Key Features](#key-features)
 		- [Basic Concept](#basic-concept)
 		- [Implementation in this package](#implementation-in-this-package)
+			- [Sharding Architecture:](#sharding-architecture)
+			- [Request Tracking:](#request-tracking)
+			- [Rate Limiting Logic](#rate-limiting-logic)
 		- [How it Works](#how-it-works)
 		- [Advantages](#advantages)
 	- [Installation](#installation)
@@ -27,7 +30,7 @@
 
 This package implements _rate limiting middleware_ for HTTP servers. It provides functionality to control the number of requests from individual IP addresses within a specified time window.
 
-A _sliding window rate limiter_ is a rate limiting algorithm that provides a smoother, more accurate way to control request rates compared to fixed window approaches. Let me explain the concept and implementation.
+A _sliding window rate limiter_ is a rate limiting algorithm that provides a smoother, more accurate way to control request rates compared to fixed window approaches.
 
 ### Key Features
 
@@ -44,16 +47,61 @@ A _sliding window rate limiter_ is a rate limiting algorithm that provides a smo
 
 ### Implementation in this package
 
+The rate limiter in this package uses a sharded sliding window algorithm.
+
+#### Sharding Architecture:
+
+	type tShardedLimiter struct {
+		shards          [256]*tSlidingWindowShard // fixed size array of shards
+		maxRequests     int                       // maximum requests per window
+		windowDuration  time.Duration             // duration of the sliding window
+		cleanupInterval time.Duration             // interval between cleanup runs
+		metrics         TMetrics                  // metrics for rate limiting
+	}
+
+The limiter distributes clients across 256 shards to reduce lock contention.
+
+#### Request Tracking:
+
 	type (
 		tSlidingWindowCounter struct {
-			mtx          sync.Mutex
-			prevCount    int           // requests in previous window
-			currentCount int           // requests in current window
-			windowStart  time.Time     // start time of current window
+			sync.Mutex             // protects counter fields
+			prevCount    int       // requests in previous window
+			currentCount int       // requests in current window
+			windowStart  time.Time // start time of current window
+		}
+	)
+
+Each client IP gets a counter that tracks:
+
+- Requests in the previous window
+- Requests in the current window
+- Start time of the current window
+
+#### Rate Limiting Logic
+
+When a request comes in:
+
+1. If it's a new IP, create a counter and allow the request.
+2. If the window has expired, reset the counter.
+3. Otherwise, increment the counter and check against the limit.
+4. Cleanup: The system automatically cleans up inactive clients:
+
+		func (sl *tShardedLimiter) cleanup() {
+			threshold := time.Now().UTC().Add(-sl.windowDuration * 2)
+			for _, sws := range sl.shards {
+				sws.cleanShard(threshold)
+			}
 		}
 
-		tClientList map[string]*tSlidingWindowCounter
-	)
+This implementation provides efficient rate limiting with:
+
+- Thread-safe operation through sharding and locks,
+- Automatic cleanup of inactive clients,
+- Support for both IPv4 and IPv6 addresses,
+- metrics for monitoring,
+- proper handling of both IPv4 and IPv6 addresses,
+- support for proxy chains via X-Forwarded-For headers.
 
 ### How it Works
 
@@ -117,22 +165,65 @@ To include the rate limiting provided by this package you just call the `Wrap()`
 
 		maxRequests := 1000 // max requests per minute
 		windowDuration := time.Minute // window duration
-		// these values should probably come from some
+		// These values should probably come from some
 		// configuration file or commandline option.
 
 		pageHandler := http.NewServeMux() // or your own page handling provider
 		pageHandler.HandleFunc("/", myHandler) // dito
 
+		// Create the rate-limited handler and get the metrics function
+		handler, getMetrics := ratelimit.Wrap(pageHandler, maxRequests, windowDuration)
+		//                     ^^^^^^^^^^^^^^^
+
+		// Start a goroutine to periodically log metrics
+		go func() {
+			for range time.NewTicker(time.Minute).C {
+				metrics := getMetrics()
+				log.Printf("Rate Limiter Metrics:\n"+
+					"Total Requests: %d\n"+
+					"Blocked Requests: %d\n"+
+					"Active Clients: %d\n"+
+					"Cleanup Interval: %v\n",
+					metrics.TotalRequests,
+					metrics.BlockedRequests,
+					metrics.ActiveClients,
+					metrics.CleanupDuration)
+			}
+		}()
+
+		// Expose metrics endpoint for monitoring systems
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			metrics := getMetrics()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(metrics)
+		})
+
 		server := http.Server{
 			Addr:    "127.0.0.1:8080",
-			Handler: ratelimit.Wrap(pageHandler, maxRequests,windowDuration),
-			//       ^^^^^^^^^^^^^^^
+			Handler: handler, // <== here is the rate-limited handler
 		}
 
 		if err := server.ListenAndServe(); nil != err {
 			log.Fatalf("%s: %v", os.Args[0], err)
 		}
 	} // main()
+
+The `Wrap()` function creates a new handler and returns it along with a function to retrieve metrics:
+
+- `http.Handler`: A new handler that implements rate limiting
+- `func() TMetrics`: A function that returns usage metrics for monitoring.
+
+The returned handler implements rate limiting by:
+
+1. extracting the client IP,
+2. checking if the request is allowed,
+3. either allowing the request to proceed or sending a `429 (Too Many Requests)` error to the client.
+
+In the example above, the implementation provides three ways to monitor your rate limiter:
+
+- Periodic logging of metrics,
+- HTTP endpoint for monitoring systems,
+- on-demand access to metrics through the getter function.
 
 ## Libraries
 
