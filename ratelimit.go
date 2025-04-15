@@ -24,8 +24,8 @@ type (
 	// window for a single client IP address.
 	tSlidingWindowCounter struct {
 		sync.Mutex             // protects counter fields
-		prevCount    int       // requests in previous window
-		currentCount int       // requests in current window
+		prevCount    uint      // requests in previous window
+		currentCount uint      // requests in current window
 		windowStart  time.Time // start time of current window
 	}
 
@@ -52,7 +52,7 @@ type (
 	// client IPs across multiple shards to reduce lock contention.
 	tShardedLimiter struct {
 		shards          [256]*tSlidingWindowShard // fixed size array of shards
-		maxRequests     int                       // maximum requests per window
+		maxRequests     uint                      // maximum requests per window
 		windowDuration  time.Duration             // duration of the sliding window
 		cleanupInterval time.Duration             // interval between cleanup runs
 		metrics         TMetrics                  // metrics for rate limiting
@@ -175,6 +175,7 @@ func (sl *tShardedLimiter) isAllowed(aIP string) bool {
 			windowStart:  now,
 		}
 		shard.clients[aIP] = counter
+
 		// First request is always allowed
 		return true
 	}
@@ -188,6 +189,7 @@ func (sl *tShardedLimiter) isAllowed(aIP string) bool {
 		counter.prevCount = counter.currentCount
 		counter.currentCount = 1
 		counter.windowStart = now
+
 		return true
 	}
 
@@ -195,9 +197,11 @@ func (sl *tShardedLimiter) isAllowed(aIP string) bool {
 	weightPrev := 1.0 - (elapsed.Seconds() / sl.windowDuration.Seconds())
 
 	// Calculate total requests using weighted sliding window
-	weightedCount := int(float64(counter.prevCount)*weightPrev) + counter.currentCount
+	weightedCount := uint(float64(counter.prevCount)*weightPrev) + counter.currentCount
 
-	allowed := weightedCount <= sl.maxRequests
+	// Check if the request is within the rate limit; don't
+	// use `<=` because the actual count is incremented below.
+	allowed := weightedCount < sl.maxRequests
 	if allowed {
 		counter.currentCount++
 	} else {
@@ -297,7 +301,7 @@ func newShard() *tSlidingWindowShard {
 } // newShard()
 
 // `newShardedLimiter()` creates a new sharded rate limiter.
-func newShardedLimiter(aMaxReq int, aDuration time.Duration) *tShardedLimiter {
+func newShardedLimiter(aMaxReq uint, aDuration time.Duration) *tShardedLimiter {
 	result := &tShardedLimiter{
 		maxRequests:     aMaxReq,
 		windowDuration:  aDuration,
@@ -329,7 +333,7 @@ func newShardedLimiter(aMaxReq int, aDuration time.Duration) *tShardedLimiter {
 // Returns:
 //   - `http.Handler`: A new handler that implements rate limiting
 //   - `func() TMetrics`: A function that returns usage metrics.
-func Wrap(aNext http.Handler, aMaxReq int, aDuration time.Duration) (http.Handler, func() TMetrics) {
+func Wrap(aNext http.Handler, aMaxReq uint, aDuration time.Duration) (http.Handler, func() TMetrics) {
 	limiter := newShardedLimiter(aMaxReq, aDuration)
 
 	// Return both the handler and a function that returns metrics
