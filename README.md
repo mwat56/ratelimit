@@ -53,7 +53,7 @@ The rate limiter in this package uses a sharded sliding window algorithm.
 
 	type tShardedLimiter struct {
 		shards          [256]*tSlidingWindowShard // fixed size array of shards
-		maxRequests     int                       // maximum requests per window
+		maxRequests     uint                      // maximum requests per window
 		windowDuration  time.Duration             // duration of the sliding window
 		cleanupInterval time.Duration             // interval between cleanup runs
 		metrics         TMetrics                  // metrics for rate limiting
@@ -66,8 +66,8 @@ The limiter distributes clients across 256 shards to reduce lock contention.
 	type (
 		tSlidingWindowCounter struct {
 			sync.Mutex             // protects counter fields
-			prevCount    int       // requests in previous window
-			currentCount int       // requests in current window
+			prevCount    uint      // requests in previous window
+			currentCount uint      // requests in current window
 			windowStart  time.Time // start time of current window
 		}
 	)
