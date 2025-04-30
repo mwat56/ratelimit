@@ -19,9 +19,14 @@ import (
 	"time"
 )
 
+const (
+	// `numOfShards` is the number of shards used in the rate limiter.
+	numOfShards = 256
+)
+
 type (
-	// `tSlidingWindowCounter` tracks request counts within a time
-	// window for a single client IP address.
+	// `tSlidingWindowCounter` tracks request counts within
+	// a time window for a single client IP address.
 	tSlidingWindowCounter struct {
 		sync.Mutex             // protects counter fields
 		prevCount    uint      // requests in previous window
@@ -29,18 +34,32 @@ type (
 		windowStart  time.Time // start time of current window
 	}
 
-	// `tClientList` maps IP addresses to their respective request
-	// counters.
+	// `tClientList` maps IP addresses to their respective request counters.
+	//
+	// The map is indexed by the client's IP address.
+	// The value is a pointer to a `tSlidingWindowCounter` that tracks
+	// the number of requests made by the client in the current and
+	// previous windows, as well as the start time of the current window.
+	//
+	// It is used within the `tSlidingWindowShard` type.
 	tClientList map[string]*tSlidingWindowCounter
 
 	// `tSlidingWindowShard` represents a single shard of the rate
 	// limiter, managing a subset of client IPs.
 	tSlidingWindowShard struct {
 		sync.Mutex             // protects clients map
-		clients    tClientList // IP-to-counter map  for this shard
+		clients    tClientList // IP-to-counter map for this shard
 	}
 
-	// `TMetrics` holds rate limiting metrics
+	// `TMetrics` holds rate limiting metrics.
+	//
+	// It is returned by the [Wrap] function.
+	//
+	// The metrics include:
+	//   - `TotalRequests`: Total number of requests processed.
+	//   - `BlockedRequests`: Number of requests that exceeded rate limits.
+	//   - `ActiveClients`: Current number of tracked client IPs.
+	//   - `CleanupDuration`: Interval between cleanup runs.
 	TMetrics struct {
 		TotalRequests   uint64        // Total number of requests processed
 		BlockedRequests uint64        // Number of requests that exceeded rate limits
@@ -51,12 +70,16 @@ type (
 	// `tShardedLimiter` implements a sharded rate limiter that distributes
 	// client IPs across multiple shards to reduce lock contention.
 	tShardedLimiter struct {
-		shards          [256]*tSlidingWindowShard // fixed size array of shards
-		maxRequests     uint                      // maximum requests per window
-		windowDuration  time.Duration             // duration of the sliding window
-		cleanupInterval time.Duration             // interval between cleanup runs
-		metrics         TMetrics                  // metrics for rate limiting
+		shards          [numOfShards]*tSlidingWindowShard // fixed size array of shards
+		maxRequests     uint                              // maximum requests per window
+		windowDuration  time.Duration                     // duration of the sliding window
+		cleanupInterval time.Duration                     // interval between cleanup runs
+		metrics         TMetrics                          // metrics for rate limiting
 	}
+
+	// `TMetricsFunc` is a function that returns rate limiting metrics.
+	// It is returned by the [Wrap] function.
+	TMetricsFunc func() TMetrics
 )
 
 // ---------------------------------------------------------------------------
@@ -70,7 +93,7 @@ type (
 func (sws *tSlidingWindowShard) cleanShard(aThreshold time.Time) {
 	del := func(aCounter *tSlidingWindowCounter, aIP string) {
 		defer func() {
-			if r := recover(); r != nil {
+			if r := recover(); nil != r {
 				log.Println("Recovered from panic:", r)
 			}
 		}()
@@ -81,7 +104,6 @@ func (sws *tSlidingWindowShard) cleanShard(aThreshold time.Time) {
 		// Remove clients that haven't made any requests
 		// in the last two windows:
 		if aCounter.windowStart.Before(aThreshold) {
-			// &&(0 == aCounter.currentCount) {
 			delete(sws.clients, aIP)
 		}
 	}
@@ -129,14 +151,18 @@ func (sl *tShardedLimiter) cleanupStart() {
 func (sl *tShardedLimiter) getShard(aIP string) *tSlidingWindowShard {
 	// Simple hash function for IP-based sharding
 	sum := 0
-	for i := 0; i < len(aIP); i++ {
+	for i := range len(aIP) {
 		sum += int(aIP[i])
 	}
 
-	return sl.shards[sum%256]
+	return sl.shards[sum%numOfShards]
 } // getShard()
 
-func (sl *tShardedLimiter) GetMetrics() TMetrics {
+// `getMetrics()` returns the current rate limiting metrics.
+//
+// Returns:
+//   - `TMetrics`: A struct containing metrics about rate limiting activity.
+func (sl *tShardedLimiter) getMetrics() TMetrics {
 	var total uint64
 	for _, shard := range sl.shards {
 		shard.Lock()
@@ -150,7 +176,7 @@ func (sl *tShardedLimiter) GetMetrics() TMetrics {
 		ActiveClients:   total,
 		CleanupDuration: sl.cleanupInterval,
 	}
-} // GetMetrics()
+} // getMetrics()
 
 // `isAllowed()` checks if a request from the given IP address is
 // allowed based on the rate limiting rules.
@@ -163,13 +189,13 @@ func (sl *tShardedLimiter) GetMetrics() TMetrics {
 func (sl *tShardedLimiter) isAllowed(aIP string) bool {
 	atomic.AddUint64(&sl.metrics.TotalRequests, 1)
 
+	now := time.Now().UTC() // Use UTC to avoid DST issues
 	shard := sl.getShard(aIP)
 	shard.Lock()
 	defer shard.Unlock()
 
-	now := time.Now().UTC() // Use UTC to avoid DST issues
-	counter, exists := shard.clients[aIP]
-	if !exists {
+	counter, ok := shard.clients[aIP]
+	if !ok {
 		counter = &tSlidingWindowCounter{
 			currentCount: 1,
 			windowStart:  now,
@@ -235,7 +261,7 @@ func cleanIP(aIP string) string {
 	}
 
 	// Convert to consistent format
-	if ipv4 := netIP.To4(); ipv4 != nil {
+	if ipv4 := netIP.To4(); nil != ipv4 {
 		return ipv4.String()
 	}
 
@@ -275,7 +301,7 @@ func getClientIP(aRequest *http.Request) (string, error) {
 
 	// Fall back to `RemoteAddr`
 	host, _, err := net.SplitHostPort(aRequest.RemoteAddr)
-	if err != nil {
+	if nil != err {
 		// Try `RemoteAddr` directly in case it's just an IP
 		if validIP := cleanIP(aRequest.RemoteAddr); "" != validIP {
 			return validIP, nil
@@ -325,6 +351,10 @@ func newShardedLimiter(aMaxReq uint, aDuration time.Duration) *tShardedLimiter {
 // `Wrap()` creates a new rate limiting middleware handler.
 // It uses a sliding window algorithm to limit requests per client IP.
 //
+// The function returns a new handler and a function to retrieve usage
+// metrics. If the `aMaxReq` is set to `0`, no rate limiting is applied
+// and the original handler is returned and the metrics function is `nil`.
+//
 // Parameters:
 //   - `aNext`: The next handler in the middleware chain.
 //   - `aMaxReq`: Maximum number of requests allowed per window.
@@ -332,8 +362,12 @@ func newShardedLimiter(aMaxReq uint, aDuration time.Duration) *tShardedLimiter {
 //
 // Returns:
 //   - `http.Handler`: A new handler that implements rate limiting
-//   - `func() TMetrics`: A function that returns usage metrics.
-func Wrap(aNext http.Handler, aMaxReq uint, aDuration time.Duration) (http.Handler, func() TMetrics) {
+//   - `TMetricsFunc`: A function that returns usage metrics or `nil` if no rate limiting is applied.
+func Wrap(aNext http.Handler, aMaxReq uint, aDuration time.Duration) (http.Handler, TMetricsFunc) {
+	if 0 == aMaxReq {
+		return aNext, nil
+	}
+
 	limiter := newShardedLimiter(aMaxReq, aDuration)
 
 	// Return both the handler and a function that returns metrics
@@ -353,7 +387,7 @@ func Wrap(aNext http.Handler, aMaxReq uint, aDuration time.Duration) (http.Handl
 			aNext.ServeHTTP(aWriter, aRequest)
 		}),
 		func() TMetrics {
-			return limiter.GetMetrics()
+			return limiter.getMetrics()
 		}
 } // Wrap()
 
