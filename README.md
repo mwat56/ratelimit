@@ -150,13 +150,13 @@ This makes it particularly suitable for APIs and web services where consistent r
 
 You can use `Go` to install this package for you:
 
-    go get -u github.com/mwat56/ratelimit
+    go get -u github.com/mwat56/ratelimit@latest
 
 ## Usage
 
 To include the rate limiting provided by this package you just call the `Wrap()` function as shown here:
 
-	import "github.com/mwat56/ratelimit"
+	import rl "github.com/mwat56/ratelimit"
 	// ...
 
 	func main() {
@@ -166,14 +166,14 @@ To include the rate limiting provided by this package you just call the `Wrap()`
 		maxRequests := 1000 // max requests per minute
 		windowDuration := time.Minute // window duration
 		// These values should probably come from some
-		// configuration file or commandline option.
+		// configuration file or commandline options.
 
 		pageHandler := http.NewServeMux() // or your own page handling provider
 		pageHandler.HandleFunc("/", myHandler) // dito
 
 		// Create the rate-limited handler and get the metrics function
-		handler, getMetrics := ratelimit.Wrap(pageHandler, maxRequests, windowDuration)
-		//                     ^^^^^^^^^^^^^^^
+		handler, getMetrics := rl.Wrap(pageHandler, maxRequests, windowDuration)
+		//                     ^^^^^^^^
 
 		// Start a goroutine to periodically log metrics
 		go func() {
